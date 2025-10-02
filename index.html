@@ -1,0 +1,754 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Toyota Supply Chain — Leaflet Map</title>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" crossorigin=""></script>
+  <!-- arrowheads plugin -->
+  <script src="https://unpkg.com/leaflet-polylinedecorator@1.7.0/dist/leaflet.polylineDecorator.min.js"></script>
+  <style>
+    html, body, #map { height: 100%; margin: 0; }
+    .legend { background: white; padding: 10px 12px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,.15); line-height: 1.25; }
+    .legend h4 { margin: 0 0 6px; font-size: 14px; }
+    .legend .row { display: flex; align-items: center; gap: 8px; margin: 5px 0; }
+    .dot { width: 14px; height: 14px; border-radius: 50%; border: 1px solid rgba(0,0,0,.25); }
+    .keyline { width: 20px; height: 0; border-top: 3px solid #333; }
+    .dash { border-top-style: dashed; }
+    .dotline { border-top-style: dotted; }
+    .map-title { position: absolute; top: 12px; left: 50%; transform: translateX(-50%); z-index: 1000; background: rgba(255,255,255,.9); border-radius: 10px; padding: 8px 12px; font-weight: 600; box-shadow: 0 2px 10px rgba(0,0,0,.15); text-align: center; }
+    .lbl { font-size: 12px; font-weight: 600; color: #111; background: rgba(255,255,255,.75); padding: 2px 6px; border-radius: 6px; border: 1px solid rgba(0,0,0,.15); }
+    .route-label {
+      background: rgba(255,255,255,0.9);
+      border: 1px solid rgba(0,0,0,0.2);
+      padding: 2px 6px;
+      border-radius: 6px;
+      font-weight: 600;
+      box-shadow: 0 1px 6px rgba(0,0,0,0.1);
+      white-space: nowrap;
+      font-size: 12px;
+      line-height: 1.2;
+    }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div class="map-title">Toyota Supply Chain <img src="https://upload.wikimedia.org/wikipedia/commons/9/9d/Toyota_carlogo.svg" alt="Toyota logo" style="height:16px; vertical-align:middle; margin-left:8px; opacity:.9;"/></div>
+  <script>
+    // 1) 地圖初始化
+    const map = L.map('map', { worldCopyJump: false }).setView([25, 20], 2);
+    L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
+      maxZoom: 8,
+      minZoom: 2,
+      attribution: '&copy; OpenStreetMap &copy; CARTO'
+    }).addTo(map);
+
+    // Create a pane for route labels (render above markers so labels are never covered)
+    const labelsPane = map.createPane('routeLabels');
+    labelsPane.style.zIndex = 650; // above markers (600) so labels are never covered
+    labelsPane.style.pointerEvents = 'none';
+
+    // Pane for route lines (above overlays like circles, below markers)
+    const routesPane = map.createPane('routes');
+    routesPane.style.zIndex = 590; // between overlayPane (~400) and markerPane (600)
+
+    // 2) 類型圖示與顏色
+    const TYPE = {
+      Supplier:   { color: '#2aa84a', emoji: '⚙️' },  // 綠
+      Manufacturer:{ color: '#1e88e5', emoji: '🏭' },  // 藍
+      Warehouse:  { color: '#fb8c00', emoji: '📦' },  // 橘
+      DC:         { color: '#8e24aa', emoji: '🏢' },  // 紫
+      Customer:   { color: '#e53935', emoji: '👤' }   // 紅
+    };
+
+    function markerFor(node){
+      const t = TYPE[node.type];
+      const html = `<div style="transform: translate(-50%,-50%); font-size:20px;">${t.emoji}</div>`;
+      const icon = L.divIcon({ html, className: '', iconSize: [24,24] });
+      // Map some country names to emoji
+      const FLAGS = {
+        'Japan': '🇯🇵',
+        'USA': '🇺🇸',
+        'Canada': '🇨🇦',
+        'Belgium': '🇧🇪',
+        'Global': '🌐'
+      };
+      let flag = FLAGS[node.country] || '';
+      // Per-node flag overrides for regional customers
+      if (node.id === 'na_customers') flag = '🇺🇸'; // North America → US flag
+      else if (node.id === 'eu_customers') flag = '🇪🇺'; // Europe → EU flag
+      else if (node.id === 'global') flag = '🌐'; // Global dealer network
+      // No jitter by default; place exactly at the node (line endpoint)
+      const marker = L.marker([node.lat, node.lng], { icon }).bindPopup(
+        `<b>${node.name} ${flag}</b><br/>Type: ${node.type}`
+      );
+      // store original location for collision-aware nudging
+      marker._baseLL = L.latLng(node.lat, node.lng);
+      if (!window.markerIndex) window.markerIndex = {};
+      window.markerIndex[node.id] = marker;
+      return marker;
+    }
+
+    // 3) 節點（座標為示意值；可依實際據點調整）
+    const nodes = [
+      // Japan
+      { id: 'denso', name: 'Denso', country: 'Japan', type: 'Supplier', lat: 34.958, lng: 137.080 }, // Anjo City, Aichi
+      { id: 'aisin', name: 'Aisin', country: 'Japan', type: 'Supplier', lat: 35.04, lng: 137.16 }, // Aichi
+      { id: 'bridgestone_jp', name: 'Bridgestone', country: 'Japan', type: 'Supplier', lat: 35.68, lng: 139.76 }, // Tokyo
+      { id: 'motomachi', name: 'Motomachi Plant', country: 'Japan', type: 'Manufacturer', lat: 35.083, lng: 137.156 }, // Toyota City, Aichi
+      { id: 'gpc_jp', name: 'GPC Japan', country: 'Japan', type: 'Warehouse', lat: 35.676, lng: 139.650 }, // Tokyo
+
+      // USA
+      { id: 'tmmk', name: 'TMMK', country: 'USA', type: 'Manufacturer', lat: 38.2098, lng: -84.5588 }, // Georgetown, KY
+      { id: 'pdc_usa', name: 'PDC USA', country: 'USA', type: 'Warehouse', lat: 39.0997, lng: -94.5786 }, // Kansas City (示意)
+      { id: 'vpc_portland', name: 'VPC Portland', country: 'USA', type: 'DC', lat: 45.523, lng: -122.676 },
+
+      // Canada
+      { id: 'tmmc', name: 'TMMC', country: 'Canada', type: 'Manufacturer', lat: 43.36, lng: -80.31 }, // Cambridge, ON
+
+      // Belgium
+      { id: 'zeebrugge', name: 'Zeebrugge Hub', country: 'Belgium', type: 'DC', lat: 51.33, lng: 3.2 },
+
+      // Customers / Regions
+      { id: 'na_customers', name: 'North America Customers', country: 'Global', type: 'Customer', lat: 31.0, lng: -99.0 },
+      { id: 'eu_customers', name: 'Europe Customers', country: 'Global', type: 'Customer', lat: 50.1, lng: 8.68 },
+      { id: 'global', name: 'Global Mfg / Dealers', country: 'Global', type: 'Customer', lat: 35.0, lng: 105.0 }
+    ];
+
+    const nodeIndex = Object.fromEntries(nodes.map(n => [n.id, n]));
+
+    // --- Marker collision aware layout: only offset when overlapping
+    function layoutMarkers(){
+      if (!window.markerIndex) return;
+      const entries = Object.entries(window.markerIndex);
+      // Reset all markers to their base positions first
+      for (const [id, m] of entries){ m.setLatLng(m._baseLL); }
+      // Compute screen-space positions
+      const pts = entries.map(([id, m]) => ({ id, m, p: map.latLngToLayerPoint(m.getLatLng()) }));
+      const used = new Set();
+      const THRESH = 22; // px, approximate icon size
+      for (let i=0;i<pts.length;i++){
+        if (used.has(pts[i].id)) continue;
+        const group = [pts[i]];
+        for (let j=i+1;j<pts.length;j++){
+          if (used.has(pts[j].id)) continue;
+          const d = pts[i].p.distanceTo(pts[j].p);
+          if (d < THRESH) group.push(pts[j]);
+        }
+        if (group.length > 1){
+          // Nudge colliding markers radially around the base point
+          const base = group[0].m._baseLL;
+          const angleStep = (Math.PI*2) / group.length;
+          const pxRadius = 14; // how far to push in pixels
+          for (let k=0;k<group.length;k++){
+            const g = group[k];
+            const ang = k*angleStep;
+            const dx = Math.cos(ang) * pxRadius;
+            const dy = Math.sin(ang) * pxRadius;
+            const p = map.latLngToLayerPoint(base);
+            const nudged = map.layerPointToLatLng(L.point(p.x + dx, p.y + dy));
+            g.m.setLatLng(nudged);
+            used.add(g.id);
+          }
+        } else {
+          used.add(pts[i].id);
+        }
+      }
+    }
+
+    // 依類型分圖層
+    const layersByType = { Supplier:L.layerGroup(), Manufacturer:L.layerGroup(), Warehouse:L.layerGroup(), DC:L.layerGroup(), Customer:L.layerGroup() };
+    nodes.forEach(n => markerFor(n).addTo(layersByType[n.type]));
+    Object.values(layersByType).forEach(g => g.addTo(map));
+    // initial collision layout
+    map.whenReady(() => layoutMarkers());
+    map.on('zoomend moveend', layoutMarkers);
+
+    // Helper functions for great-circle arcs
+    function toRad(d){ return d * Math.PI / 180; }
+    function toDeg(r){ return r * 180 / Math.PI; }
+    function haversineKm(lat1, lon1, lat2, lon2){
+      const R = 6371; // km
+      const dLat = toRad(lat2 - lat1);
+      const dLon = toRad(lon2 - lon1);
+      const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+      return R * c;
+    }
+    function greatCirclePoints(lat1, lon1, lat2, lon2, segments=128){
+      // Spherical linear interpolation between endpoints on the unit sphere
+      const φ1 = toRad(lat1), λ1 = toRad(lon1);
+      const φ2 = toRad(lat2), λ2 = toRad(lon2);
+      const v1 = [ Math.cos(φ1)*Math.cos(λ1), Math.cos(φ1)*Math.sin(λ1), Math.sin(φ1) ];
+      const v2 = [ Math.cos(φ2)*Math.cos(λ2), Math.cos(φ2)*Math.sin(λ2), Math.sin(φ2) ];
+      const dot = Math.min(1, Math.max(-1, v1[0]*v2[0] + v1[1]*v2[1] + v1[2]*v2[2]));
+      const ω = Math.acos(dot);
+      const sinω = Math.sin(ω);
+      const pts = [];
+      if (sinω === 0) return [[lat1, lon1], [lat2, lon2]]; // same point
+      for (let i=0; i<=segments; i++){
+        const t = i/segments;
+        const a = Math.sin((1-t)*ω)/sinω;
+        const b = Math.sin(t*ω)/sinω;
+        const x = a*v1[0] + b*v2[0];
+        const y = a*v1[1] + b*v2[1];
+        const z = a*v1[2] + b*v2[2];
+        const φ = Math.atan2(z, Math.sqrt(x*x + y*y));
+        const λ = Math.atan2(y, x);
+        pts.push([ toDeg(φ), toDeg(λ) ]);
+      }
+      return pts;
+    }
+
+    // --- Spherical quadratic Bézier (smooth arc bending toward a control point)
+    function latLngToVec(lat, lng){
+      const φ = toRad(lat), λ = toRad(lng);
+      return [ Math.cos(φ)*Math.cos(λ), Math.cos(φ)*Math.sin(λ), Math.sin(φ) ];
+    }
+    function vecToLatLng(v){
+      const [x,y,z] = v;
+      const φ = Math.atan2(z, Math.hypot(x,y));
+      const λ = Math.atan2(y, x);
+      return [ toDeg(φ), toDeg(λ) ];
+    }
+    function slerp(a, b, t){
+      // a, b are 3D unit vectors
+      let dot = a[0]*b[0] + a[1]*b[1] + a[2]*b[2];
+      dot = Math.min(1, Math.max(-1, dot));
+      const ω = Math.acos(dot);
+      if (ω === 0) return a.slice();
+      const s1 = Math.sin((1-t)*ω) / Math.sin(ω);
+      const s2 = Math.sin(t*ω) / Math.sin(ω);
+      return [ a[0]*s1 + b[0]*s2, a[1]*s1 + b[1]*s2, a[2]*s1 + b[2]*s2 ];
+    }
+    function sphericalQuadraticArc(aLat,aLng, cLat,cLng, bLat,bLng, segments=192){
+      const A = latLngToVec(aLat,aLng);
+      const C = latLngToVec(cLat,cLng);
+      const B = latLngToVec(bLat,bLng);
+      const pts = [];
+      for (let i=0;i<=segments;i++){
+        const t = i/segments;
+        const p = slerp( slerp(A,C,t), slerp(C,B,t), t );
+        // normalize to unit sphere to reduce drift
+        const m = Math.hypot(p[0],p[1],p[2]) || 1;
+        pts.push( vecToLatLng([p[0]/m, p[1]/m, p[2]/m]) );
+      }
+      return pts;
+    }
+
+    // --- Big-bow convex arc based on great-circle normal (no inflection)
+    function cross(a,b){ return [ a[1]*b[2]-a[2]*b[1], a[2]*b[0]-a[0]*b[2], a[0]*b[1]-a[1]*b[0] ]; }
+    function norm(v){ const m=Math.hypot(v[0],v[1],v[2])||1; return [v[0]/m,v[1]/m,v[2]/m]; }
+    function rotateAroundAxis(v, k, deg){
+      const rad = toRad(deg), cos=Math.cos(rad), sin=Math.sin(rad);
+      const [x,y,z]=v, [u,vv,w]=k;
+      return [
+        (u*u + (1-u*u)*cos)*x + (u*vv*(1-cos) - w*sin)*y + (u*w*(1-cos) + vv*sin)*z,
+        (u*vv*(1-cos) + w*sin)*x + (vv*vv + (1-vv*vv)*cos)*y + (vv*w*(1-cos) - u*sin)*z,
+        (u*w*(1-cos) - vv*sin)*x + (vv*w*(1-cos) + u*sin)*y + (w*w + (1-w*w)*cos)*z
+      ];
+    }
+    function bowedArc(aLat,aLng,bLat,bLng,sideSign,deltaDeg=65,segments=320){
+      const A = latLngToVec(aLat,aLng);
+      const B = latLngToVec(bLat,bLng);
+      const N = norm(cross(A,B)); // great-circle normal
+      const M = norm(slerp(A,B,0.5)); // midpoint on GC
+      const side = sideSign>=0 ? 1 : -1;
+      const Cvec = norm( rotateAroundAxis(M, N, side*deltaDeg) );
+      const C = vecToLatLng(Cvec);
+      return sphericalQuadraticArc(aLat,aLng, C[0],C[1], bLat,bLng, segments);
+    }
+
+    // --- Spread variant of bowed arc: same southward big bow, tiny per-route variation
+    function bowedArcSpread(aLat,aLng,bLat,bLng,sideSign,baseDeltaDeg=70,spreadDelta=10,segments=340,key=''){
+      // Deterministic small offsets based on route key
+      let h = 0; for (let i=0;i<key.length;i++){ h = (h*31 + key.charCodeAt(i))|0; }
+      const bias = ((Math.abs(h)%1001)/1000 - 0.5) * 2; // in [-1,1]
+      const deltaDeg = baseDeltaDeg + bias * spreadDelta; // e.g., 70 ± 10
+      // Also skew the midpoint sampling slightly to avoid identical label midpoints
+      const skewT = 0.5 + 0.08 * bias; // 0.42 .. 0.58
+      const A = latLngToVec(aLat,aLng);
+      const B = latLngToVec(bLat,bLng);
+      const N = norm(cross(A,B));
+      const M = norm(slerp(A,B,skewT));
+      const side = sideSign>=0 ? 1 : -1;
+      const Cvec = norm( rotateAroundAxis(M, N, side*deltaDeg) );
+      const C = vecToLatLng(Cvec);
+      return sphericalQuadraticArc(aLat,aLng, C[0],C[1], bLat,bLng, segments);
+    }
+
+    // --- Local small-bow spread for short, dense links (e.g., inside Japan)
+    function localArcSpread(aLat,aLng,bLat,bLng,key,baseDeltaDeg=18,spreadDeg=8,segments=140){
+      // Use hash to pick side (+/-) and small delta variation so lines don't overlap
+      let h = 0; for (let i=0;i<key.length;i++){ h = (h*31 + key.charCodeAt(i))|0; }
+      const bias = ((Math.abs(h)%1001)/1000 - 0.5) * 2; // [-1,1]
+      const sideSign = bias >= 0 ? +1 : -1; // alternate sides
+      const delta = baseDeltaDeg + bias * spreadDeg; // 18 ± 8
+      return bowedArc(aLat,aLng,bLat,bLng,sideSign,delta,segments);
+    }
+
+    // --- Deterministic Japan control points to bend very short domestic arcs
+    const JAPAN_CTRL_CITIES = [
+      { name:'Sapporo', lat: 43.06, lng: 141.35 },
+      { name:'Sendai',  lat: 38.27, lng: 140.87 },
+      { name:'Niigata', lat: 37.92, lng: 139.04 },
+      { name:'Nagoya',  lat: 35.18, lng: 136.91 },
+      { name:'Fukuoka', lat: 33.59, lng: 130.40 }
+    ];
+    function japanCtrlForRoute(key){
+      let h = 0; for (let i=0;i<key.length;i++){ h = (h*31 + key.charCodeAt(i))|0; }
+      const idx = Math.abs(h) % JAPAN_CTRL_CITIES.length;
+      return JAPAN_CTRL_CITIES[idx];
+    }
+    function japanShortArc(aLat,aLng,bLat,bLng,key,segments=180){
+      const c = japanCtrlForRoute(key);
+      return sphericalQuadraticArc(aLat,aLng, c.lat,c.lng, bLat,bLng, segments);
+    }
+
+    function ensurePolylineDecorator(ready){
+      if (window.L && L.polylineDecorator) { ready(true); return; }
+      const s = document.createElement('script');
+      s.src = 'https://cdn.jsdelivr.net/npm/leaflet-polylinedecorator@1.7.0/dist/leaflet.polylineDecorator.min.js';
+      s.onload = () => ready(true);
+      s.onerror = () => ready(false);
+      document.head.appendChild(s);
+    }
+
+    function southBiasedArc(aLat, aLng, bLat, bLng, biasLat=-20, segmentsEach=64){
+      // Choose a control longitude roughly midway, unwrapped to avoid jumps
+      let midLng = (aLng + bLng) / 2;
+      // If endpoints straddle the dateline, pick a midpoint consistent with unwrap logic
+      if (Math.abs(aLng - bLng) > 180) {
+        if (aLng > bLng) midLng += 180; else midLng -= 180;
+      }
+      const ctrlLat = Math.min(aLat, bLat, 0) + biasLat; // push into southern hemisphere
+      const part1 = greatCirclePoints(aLat, aLng, ctrlLat, midLng, segmentsEach);
+      const part2 = greatCirclePoints(ctrlLat, midLng, bLat, bLng, segmentsEach).slice(1);
+      return part1.concat(part2);
+    }
+
+    // --- Helper to deterministically "spread" arcs for similar routes ---
+    function hashStr(s){
+      let h = 0;
+      for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+      return Math.abs(h);
+    }
+    // Deterministic Africa control point per route to force southward bow and avoid overlap
+    function africaCtrlForRoute(key, baseLat=-32, baseLng=-5, latSpread=6, lngSpread=10){
+      // Use hash to derive small biases so multiple A-routes fan out but all remain over Africa/Atlantic
+      const h = hashStr(key);
+      const u1 = ((h % 1001) / 1000) * 2 - 1;           // [-1,1]
+      const u2 = ((((h/1001)|0) % 1001) / 1000) * 2 - 1; // [-1,1]
+      return {
+        lat: baseLat + u1 * latSpread,   // ~ [-38, -26]
+        lng: baseLng + u2 * lngSpread    // ~ [-15, +5]
+      };
+    }
+    // Create a spread arc by routing through a perturbed midpoint control point.
+    // bias range is small (±5°) so geometry stays realistic while visually separated
+    function spreadArc(aLat, aLng, bLat, bLng, key, latRange=5, lonRange=5, segEach=64){
+      const h = hashStr(key);
+      let midLng = (aLng + bLng) / 2;
+      if (Math.abs(aLng - bLng) > 180) { midLng += (aLng > bLng ? 180 : -180); }
+      const midLat = (aLat + bLat) / 2;
+      const biasLat = ((h % 1001) / 1000 - 0.5) * 2 * latRange; // -latRange..+latRange
+      const biasLon = (((Math.floor(h/1001)) % 1001) / 1000 - 0.5) * 2 * lonRange; // -lonRange..+lonRange
+      const ctrlLat = midLat + biasLat;
+      const ctrlLng = midLng + biasLon;
+      const p1 = greatCirclePoints(aLat, aLng, ctrlLat, ctrlLng, segEach);
+      const p2 = greatCirclePoints(ctrlLat, ctrlLng, bLat, bLng, segEach).slice(1);
+      return p1.concat(p2);
+    }
+
+    // --- Route via Africa: two-segment great-circle through a fixed control point in Africa
+    function africaViaArc(aLat, aLng, bLat, bLng, ctrlLat=10, ctrlLng=20, segEach=96){
+      // Default control near West/Central Africa (10°N, 20°E)
+      const p1 = greatCirclePoints(aLat, aLng, ctrlLat, ctrlLng, segEach);
+      const p2 = greatCirclePoints(ctrlLat, ctrlLng, bLat, bLng, segEach).slice(1);
+      return p1.concat(p2);
+    }
+
+
+    // Label collision-lite handling: cycle small pixel offsets for labels that share similar midpoints
+    const LABEL_OFFSETS = [
+      [0, 0], [18, 0], [0, 18], [-18, 0], [0, -18],
+      [14, 14], [-14, 14], [-14, -14], [14, -14]
+    ];
+    const labelSlotMap = Object.create(null);
+    function nextLabelOffset(lat, lng){
+      const key = lat.toFixed(1) + ',' + lng.toFixed(1); // ~0.1° cell
+      const idx = (labelSlotMap[key] || 0) % LABEL_OFFSETS.length;
+      labelSlotMap[key] = (labelSlotMap[key] || 0) + 1;
+      return LABEL_OFFSETS[idx];
+    }
+
+    // --- Advanced route label placement (angle-aware + simple collision avoidance)
+    function pathBearingDeg(coords, idx){
+      const i1 = Math.max(0, idx-1);
+      const i2 = Math.min(coords.length-1, idx+1);
+      const p1 = L.latLng(coords[i1][0], coords[i1][1]);
+      const p2 = L.latLng(coords[i2][0], coords[i2][1]);
+      const a = map.latLngToLayerPoint(p1);
+      const b = map.latLngToLayerPoint(p2);
+      return Math.atan2(b.y - a.y, b.x - a.x) * 180/Math.PI; // screen-space bearing
+    }
+
+    function pathLengthPx(coords){
+      let len = 0;
+      for (let i=1;i<coords.length;i++){
+        const a = map.latLngToLayerPoint(coords[i-1]);
+        const b = map.latLngToLayerPoint(coords[i]);
+        len += a.distanceTo(b);
+      }
+      return len;
+    }
+
+    const LABEL_CANDIDATE_T = [0.50, 0.60, 0.40, 0.70, 0.30, 0.80, 0.20];
+    const LABEL_OFFSETS_PX = [0, 14, 22, 30, 38, 46, 56, 64, 80, 96, 120];
+    const LABEL_SIDES = [0, +1, -1, +1, -1, +2, -2, +3, -3, +4, -4]; // allow farther offsets
+    const placedLabelRects = [];
+    // Build simple rectangles around each marker to avoid covering icons
+    const markerBoxes = [];
+    function computeMarkerBoxes(){
+      markerBoxes.length = 0;
+      const iconSize = 28; // approximate marker footprint in px
+      const half = iconSize / 2;
+      nodes.forEach(n => {
+        const p = map.latLngToLayerPoint([n.lat, n.lng]);
+        markerBoxes.push({ x: p.x - half, y: p.y - half, w: iconSize, h: iconSize });
+      });
+    }
+    map.on('zoomend moveend', () => { markerBoxes.length = 0; });
+
+    function rectsOverlap(r1, r2){
+      return !(r2.x > r1.x + r1.w || r2.x + r2.w < r1.x || r2.y > r1.y + r1.h || r2.y + r2.h < r1.y);
+    }
+
+    function reserveLabelRect(centerPt, text){
+      // Estimate label rectangle
+      const approxW = Math.min(360, Math.max(110, 8*text.length + 20));
+      const approxH = 26; // matches CSS line-height
+      const rect = { x: centerPt.x - approxW/2, y: centerPt.y - approxH/2, w: approxW, h: approxH };
+
+      // Ensure marker boxes are up-to-date for current zoom
+      if (!markerBoxes.length) computeMarkerBoxes();
+
+      // Expand marker boxes by a safety margin so labels keep distance from icons
+      const margin = 8;
+      for (const m of markerBoxes){
+        const mx = m.x - margin, my = m.y - margin, mw = m.w + margin*2, mh = m.h + margin*2;
+        if (!(rect.x > mx+mw || rect.x + rect.w < mx || rect.y > my+mh || rect.y + rect.h < my)) return null;
+      }
+      // Check against already-placed labels
+      for (const r of placedLabelRects){
+        if (!(rect.x > r.x + r.w || rect.x + rect.w < r.x || rect.y > r.y + r.h || rect.y + rect.h < r.y)) return null;
+      }
+      placedLabelRects.push(rect);
+      return rect;
+    }
+
+    // --- Explicit label placement overrides (key: `${sourceId}->${targetId}`)
+    const labelOverrides = {
+      // A. Suppliers -> Manufacturers / Warehouses
+      'denso->motomachi':        { fixedLL: [33.10, 135.05] },    // Japan (Aichi) – adjust as needed
+      'aisin->motomachi':        { fixedLL: [36.5, 132.12] },    // Japan (Aichi)
+      'bridgestone_jp->tmmk':    { fixedLL: [10.0, 0.0] },     // North Pacific mid-arc (long-haul) – adjust
+      'bridgestone_jp->tmmc':    { fixedLL: [20.0, 0.0] },     // North Pacific mid-arc – adjust
+      'denso->gpc_jp':           { fixedLL: [40.00, 140.50] },    // Near Tokyo Bay
+      'bridgestone_jp->pdc_usa': { fixedLL: [0.0, 0.0] },     // Mid-Pacific – adjust
+
+      // B. Warehouses -> Manufacturers / Dealers
+      'gpc_jp->global':          { fixedLL: [40.9042, 90.4074] }, // Beijing (requested)
+      'pdc_usa->tmmk':           { fixedLL: [38.400, -87.5000] }, // IN/KY border (requested)
+      'pdc_usa->tmmc':           { fixedLL: [43.5, -85.0] },       // Upper Midwest – adjust
+
+      // C. Finished Vehicles -> DC
+      'motomachi->zeebrugge':    { fixedLL: [66.0, 60.0] },        // Siberia/Asia mid-arc – adjust
+      'tmmk->vpc_portland':      { fixedLL: [44.0, -114.0] },      // Rockies – adjust
+      'tmmc->vpc_portland':      { fixedLL: [50.0, -110.0] },      // PNW – adjust
+
+      // D. DC -> Customers
+      'zeebrugge->eu_customers': { fixedLL: [48.8566, 2.3522] },   // France/Paris (requested)
+      'vpc_portland->na_customers': { fixedLL: [35.5816, -130.4944] } // California/Sacramento (requested)
+    };
+
+    function placePermanentLabel(group, coords, text, key){
+      computeMarkerBoxes();
+      const lengthPx = pathLengthPx(coords.map(c => L.latLng(c[0], c[1])));
+      const maxOffsetPx = Math.max(8, Math.min(40, lengthPx * 0.3)); // at most 30% of path length, up to 40px
+      // If there is an explicit override for this route, try to place the label accordingly first
+      if (key && labelOverrides[key]){
+        const ov = labelOverrides[key];
+        if (ov.fixedLL){
+          const labelIcon = L.divIcon({ className: 'route-label', html: text, iconSize: null });
+          L.marker([ov.fixedLL[0], ov.fixedLL[1]], { icon: labelIcon, pane: 'routeLabels', interactive: false }).addTo(group);
+          return true; // always place fixed labels
+        }
+        const idx = Math.max(0, Math.min(coords.length-1, Math.floor((coords.length-1)*(ov.t ?? 0.5))));
+        const midLL = L.latLng(coords[idx][0], coords[idx][1]);
+        const midPt = map.latLngToLayerPoint(midLL);
+        // Compute screen-space normal from local bearing
+        const angleDeg = pathBearingDeg(coords, idx);
+        const normalRad = (angleDeg + 90) * Math.PI/180;
+        const dist = Math.min(ov.offset ?? 20, maxOffsetPx);
+        const side = (ov.side ?? 0) >= 0 ? 1 : -1;
+        const dx = side === 0 ? 0 : Math.cos(normalRad) * dist * Math.sign(side);
+        const dy = side === 0 ? 0 : Math.sin(normalRad) * dist * Math.sign(side);
+        // Tangential (along-path) nudge to prevent overlap when perpendicular offsets still collide
+        const tanRad = angleDeg * Math.PI/180;
+        const along = ov.along ?? 0;
+        const tx = Math.cos(tanRad) * along;
+        const ty = Math.sin(tanRad) * along;
+        const candidatePt = L.point(midPt.x + dx + tx, midPt.y + dy + ty);
+        const rect = reserveLabelRect(candidatePt, text);
+        if (rect){
+          const candidateLL = map.layerPointToLatLng(candidatePt);
+          const labelIcon = L.divIcon({ className: 'route-label', html: text, iconSize: null });
+          L.marker(candidateLL, { icon: labelIcon, pane: 'routeLabels', interactive: false }).addTo(group);
+          return true;
+        }
+      }
+      // Try different along-path positions and perpendicular offsets
+      for (const t of LABEL_CANDIDATE_T){
+        const idx = Math.max(0, Math.min(coords.length-1, Math.floor((coords.length-1)*t)));
+        const midLL = L.latLng(coords[idx][0], coords[idx][1]);
+        const midPt = map.latLngToLayerPoint(midLL);
+        const angleDeg = pathBearingDeg(coords, idx);
+        const normalRad = (angleDeg + 90) * Math.PI/180;
+        // Try centered label first (no perpendicular offset)
+        {
+          const candidatePt = midPt;
+          const rect = reserveLabelRect(candidatePt, text);
+          if (rect){
+            const candidateLL = map.layerPointToLatLng(candidatePt);
+            const labelIcon = L.divIcon({ className: 'route-label', html: text, iconSize: null });
+            L.marker(candidateLL, { icon: labelIcon, pane: 'routeLabels', interactive: false }).addTo(group);
+            return true;
+          }
+        }
+        for (let k=0; k<LABEL_OFFSETS_PX.length; k++){
+          const side = LABEL_SIDES[k % LABEL_SIDES.length];
+          const dist = Math.min(LABEL_OFFSETS_PX[k], maxOffsetPx);
+          const dx = side === 0 ? 0 : Math.cos(normalRad) * dist * Math.sign(side);
+          const dy = side === 0 ? 0 : Math.sin(normalRad) * dist * Math.sign(side);
+          const candidatePt = L.point(midPt.x + dx, midPt.y + dy);
+          const rect = reserveLabelRect(candidatePt, text);
+          if (rect){
+            const candidateLL = map.layerPointToLatLng(candidatePt);
+            const labelIcon = L.divIcon({ className: 'route-label', html: text, iconSize: null });
+            L.marker(candidateLL, { icon: labelIcon, pane: 'routeLabels', interactive: false })
+              .addTo(group);
+            return true;
+          }
+        }
+      }
+      // Fallback: place at geometric midpoint without collision checks
+      const midIdx = Math.floor((coords.length-1)/2);
+      const mid = coords[midIdx];
+      const labelIcon = L.divIcon({ className: 'route-label', html: text, iconSize: null });
+      L.marker([mid[0], mid[1]], { icon: labelIcon, pane: 'routeLabels', interactive: false })
+        .addTo(group);
+      return false;
+    }
+
+    // 4) 連線（箭頭）
+    // 分類樣式：A供應、B倉儲支援、C成品、D最終配送
+    const LINK_STYLE = {
+      A: { color: '#2aa84a', weight: 2, dashArray: '6 6', lineCap: 'butt', opacity: 0.9 },       // 綠 虛線
+      B: { color: '#fb8c00', weight: 2, dashArray: '2 6', opacity: 0.9 },       // 橘 點狀
+      C: { color: '#1e88e5', weight: 3, opacity: 0.9 },                         // 藍 實線
+      D: { color: '#e53935', weight: 3, opacity: 0.9 }                          // 紅 實線
+    };
+
+    const links = [
+      // A. Suppliers -> Manufacturers / Warehouses
+      ['denso','motomachi','A'],           // 1
+      ['aisin','motomachi','A'],           // 2
+      ['bridgestone_jp','tmmk','A'],       // 3
+      ['bridgestone_jp','tmmc','A'],       // 4
+      ['denso','gpc_jp','A'],              // 5
+      ['bridgestone_jp','pdc_usa','A'],    // 6
+
+      // B. Warehouses -> Manufacturers / Dealers
+      ['gpc_jp','global','B'],             // 7 (示意到全球節點)
+      ['pdc_usa','tmmk','B'],              // 8a
+      ['pdc_usa','tmmc','B'],              // 8b
+
+      // C. Finished Vehicles -> DC
+      ['motomachi','zeebrugge','C'],       // 9 跨洋
+      ['tmmk','vpc_portland','C'],         // 10
+      ['tmmc','vpc_portland','C'],         // 11
+
+      // D. DC -> Customers
+      ['zeebrugge','eu_customers','D'],    // 12
+      ['vpc_portland','na_customers','D']  // 13
+    ];
+
+    // --- Utility to unwrap longitudes for dateline continuity
+    function unwrapLngs(points, baseLng){
+      let prev = (baseLng !== undefined && baseLng !== null) ? baseLng : points[0][1];
+      const out = [];
+      for (const [lat, lng0] of points){
+        let lng = lng0;
+        while (lng - prev > 180) lng -= 360;
+        while (lng - prev < -180) lng += 360;
+        out.push([lat, lng]);
+        prev = lng;
+      }
+      return out;
+    }
+
+    // Control point used to bend long-haul Supply arcs more strongly via Africa
+    const AFRICA_CTRL = { lat: -34, lng: -10 }; // deep South Atlantic (baseline)
+
+
+    function normalizeLng(lng){
+      // Wrap longitude into [-180,180]
+      let x = lng;
+      while (x > 180) x -= 360;
+      while (x < -180) x += 360;
+      return x;
+    }
+    function sanitizeCoords(coords){
+      const out = [];
+      for (const p of coords){
+        if (!p || isNaN(p[0]) || isNaN(p[1])) continue;
+        out.push([ p[0], normalizeLng(p[1]) ]);
+      }
+      return out.length ? out : null;
+    }
+
+    // Flag emoji helper for a node (same logic as popups)
+    function flagForNode(n){
+      const FLAGS = { 'Japan':'🇯🇵', 'USA':'🇺🇸', 'Canada':'🇨🇦', 'Belgium':'🇧🇪', 'Global':'🌐' };
+      if (!n) return '';
+      if (n.id === 'na_customers') return '🇺🇸';
+      if (n.id === 'eu_customers') return '🇪🇺';
+      if (n.id === 'global') return '🌐';
+      return FLAGS[n.country] || '';
+    }
+
+    function addArrow(a, b, kind){
+      const na = nodeIndex[a], nb = nodeIndex[b];
+      if (!na || !nb) return null;
+      const style = LINK_STYLE[kind];
+
+      // Group to keep line + arrows together for layer toggling
+      const group = L.layerGroup();
+
+      // Determine path shape: geodesic for long-haul, straight for short-haul
+      const distKm = haversineKm(na.lat, na.lng, nb.lat, nb.lng);
+      let coords;
+      if (distKm > 2500) {
+        if (kind === 'A' && (nb.country === 'USA' || nb.country === 'Canada')) {
+          // Single smooth arc that bows south via Africa; per-route control point fans lines apart
+          const ctrl = africaCtrlForRoute(`${a}->${b}`, AFRICA_CTRL.lat, AFRICA_CTRL.lng, 6, 10);
+          coords = sphericalQuadraticArc(na.lat, na.lng, ctrl.lat, ctrl.lng, nb.lat, nb.lng, 360);
+        } else {
+          coords = greatCirclePoints(na.lat, na.lng, nb.lat, nb.lng, 180);
+        }
+      } else {
+        // Short-haul: for Japan→Japan A-links, draw small distinct arcs; others stay straight
+        if (kind === 'A' && na.country === 'Japan' && nb.country === 'Japan'){
+          // Force a visible arc via a deterministic Japanese city (Sapporo/Sendai/Niigata/Nagoya/Fukuoka)
+          coords = japanShortArc(na.lat, na.lng, nb.lat, nb.lng, `${a}->${b}`, 200);
+        } else {
+          coords = [[na.lat, na.lng], [nb.lat, nb.lng]];
+        }
+      }
+      // Keep longitudes continuous
+      coords = unwrapLngs(coords, na.lng);
+      coords = sanitizeCoords(coords) || greatCirclePoints(na.lat, na.lng, nb.lat, nb.lng, 160);
+
+      // Base line
+      const line = L.polyline(coords, { ...style, noClip: true, pane: 'routes' });
+      line.addTo(group);
+
+      // Always-visible direction label with angle-aware, collision-lite placement
+      const flagA = flagForNode(na);
+      const flagB = flagForNode(nb);
+      placePermanentLabel(group, coords, `${na.name} ${flagA} → ${nb.name} ${flagB}`, `${a}->${b}`);
+
+      // Repeated arrowheads along the line (directional)
+      if (L.polylineDecorator) {
+        const arrowOpts = {
+          pixelSize: 10,
+          pathOptions: { color: style.color, weight: style.weight, opacity: style.opacity }
+        };
+        const patterns = (kind === 'A')
+          // For dashed Supply links: use only a clean terminal arrow so it doesn't clash with the dash pattern
+          ? [ { offset: '92%', repeat: 0, symbol: L.Symbol.arrowHead({ pixelSize: 12, pathOptions: arrowOpts.pathOptions }) } ]
+          // For others: repeat small arrows and add a terminal arrow
+          : [
+              { offset: '12%', repeat: '20%', symbol: L.Symbol.arrowHead(arrowOpts) },
+              { offset: '96%', repeat: 0, symbol: L.Symbol.arrowHead({ pixelSize: 12, pathOptions: arrowOpts.pathOptions }) }
+            ];
+        L.polylineDecorator(line, { patterns }).addTo(group);
+      } else {
+        // Arrowheads plugin not available; render line without heads.
+      }
+
+      return group;
+    }
+
+    const linkLayers = { A:L.layerGroup(), B:L.layerGroup(), C:L.layerGroup(), D:L.layerGroup() };
+    function buildLinks(){
+      placedLabelRects.length = 0; // reset label collision state per build
+      links.forEach(([s, t, k]) => {
+        const grp = addArrow(s, t, k);
+        if (grp) grp.addTo(linkLayers[k]);
+      });
+      Object.values(linkLayers).forEach(g => g.addTo(map));
+    }
+    ensurePolylineDecorator(() => buildLinks());
+
+    // 5) 區域面（顧客區）
+    const naArea = L.circle([39.5, -98.35], { radius: 2400000, color: '#e53935', weight: 1, fillOpacity: .06 }).addTo(map); // 北美示意圈
+    const euArea = L.circle([50.1, 8.68], { radius: 1200000, color: '#e53935', weight: 1, fillOpacity: .06 }).addTo(map);    // 歐洲示意圈
+    const asiaArea = L.circle([18.0, 112.0], { radius: 3800000, color: '#e53935', weight: 1, fillOpacity: .06 }).addTo(map); // 覆蓋中國與印尼（縮小）
+
+    // 6) 圖層控制
+    const overlays = {
+      'A Supply (Suppliers → Mfg/Warehouses)': linkLayers.A,
+      'B Warehouse Support (Warehouses → Mfg/Dealers)': linkLayers.B,
+      'C Finished Vehicles (Manufacturers → DCs)': linkLayers.C,
+      'D Final Delivery (DCs → Customers)': linkLayers.D,
+      '⚙️ Suppliers': layersByType.Supplier,
+      '🏭 Manufacturers': layersByType.Manufacturer,
+      '📦 Warehouses': layersByType.Warehouse,
+      '🏢 Distribution Centers': layersByType.DC,
+      '👤 Customers': layersByType.Customer,
+      'North America Market Area': naArea,
+      'Europe Market Area': euArea,
+      'Asia Market Area': asiaArea
+    };
+    L.control.layers({}, overlays, { collapsed: false }).addTo(map);
+
+    // 7) 圖例
+    const legend = L.control({ position: 'bottomright' });
+    legend.onAdd = function(){
+      const div = L.DomUtil.create('div', 'legend');
+      div.innerHTML = `
+          <h4>Legend</h4>
+          <div class="row"><span style="font-size:16px;">⚙️</span>&nbsp;Supplier</div>
+          <div class="row"><span style="font-size:16px;">🏭</span>&nbsp;Manufacturer</div>
+          <div class="row"><span style="font-size:16px;">📦</span>&nbsp;Warehouse</div>
+          <div class="row"><span style="font-size:16px;">🏢</span>&nbsp;Distribution Center</div>
+          <div class="row"><span style="font-size:16px;">👤</span>&nbsp;Customer</div>
+          <hr style="margin:8px 0;"/>
+          <div class="row"><span class="keyline dash" style="border-color:${LINK_STYLE.A.color}"></span>&nbsp;A Supply</div>
+          <div class="row"><span class="keyline dotline" style="border-color:${LINK_STYLE.B.color}"></span>&nbsp;B Warehouse Support</div>
+          <div class="row"><span class="keyline" style="border-color:${LINK_STYLE.C.color}"></span>&nbsp;C Finished Vehicles</div>
+          <div class="row"><span class="keyline" style="border-color:${LINK_STYLE.D.color}"></span>&nbsp;D Final Delivery</div>
+        `;
+      return div;
+    };
+    legend.addTo(map);
+
+    // 8) 自動縮放
+    const boundsPts = nodes.map(n => [n.lat, n.lng]);
+    map.fitBounds(L.latLngBounds(boundsPts), { padding: [30,30] });
+  </script>
+</body>
+</html>
