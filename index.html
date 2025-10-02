@@ -723,7 +723,7 @@
       'Europe Market Area': euArea,
       'Asia Market Area': asiaArea
     };
-    L.control.layers({}, overlays, { collapsed: false }).addTo(map);
+    L.control.layers({}, overlays, { collapsed: true }).addTo(map);
 
     // 7) 圖例
     const legend = L.control({ position: 'bottomright' });
@@ -748,7 +748,13 @@
 
     // 8) 自動縮放
     const boundsPts = nodes.map(n => [n.lat, n.lng]);
-    map.fitBounds(L.latLngBounds(boundsPts), { padding: [30,30] });
+    const allBounds = L.latLngBounds(boundsPts);
+    map.fitBounds(allBounds, { padding: [30,30] });
+    // Boost the default zoom a bit after fitting bounds (so it starts closer)
+    map.whenReady(() => {
+      const z = map.getZoom();
+      map.setView(allBounds.getCenter(), Math.min(z + 1, 5)); // increase by 1 level, cap at 5
+    });
   </script>
 </body>
 </html>
